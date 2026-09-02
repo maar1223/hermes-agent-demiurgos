@@ -227,6 +227,49 @@ class TestAdapterInit:
         assert captured["checkpoint_max_file_size_mb"] == 4
 
 
+    def test_create_agent_no_tools_empties_toolset(self, monkeypatch):
+        """``no_tools=True`` (the tool_choice "none" contract) must build the
+        agent with an EMPTY enabled_toolsets list — so agent.tools == [] and
+        no tool can run.  Default callers keep the configured platform
+        toolsets exactly as before."""
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            lambda: {"provider": "openai", "base_url": "https://example.test/v1"},
+        )
+        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "gpt-5.5")
+        monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+        monkeypatch.setattr(
+            "gateway.run.GatewayRunner._load_reasoning_config",
+            staticmethod(lambda model="": {"enabled": True, "effort": "high"}),
+        )
+        monkeypatch.setattr(
+            "gateway.run.GatewayRunner._load_fallback_model",
+            staticmethod(lambda: None),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.tools_config._get_platform_tools",
+            lambda *_, **__: {"terminal", "web"},
+        )
+
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+        # Default behavior: configured platform toolsets flow through unchanged.
+        adapter._create_agent(session_id="api-session")
+        assert captured["enabled_toolsets"] == ["terminal", "web"]
+
+        # tool_choice "none" contract: empty toolset → no tools exposed.
+        adapter._create_agent(session_id="api-session", no_tools=True)
+        assert captured["enabled_toolsets"] == []
+
+
 # ---------------------------------------------------------------------------
 # Auth checking
 # ---------------------------------------------------------------------------
@@ -982,6 +1025,122 @@ class TestChatCompletionsEndpoint:
             assert resp.status == 400
             data = await resp.json()
             assert "messages" in data["error"]["message"]
+
+
+    @pytest.mark.asyncio
+    async def test_chat_completions_tool_choice_none_passes_no_tools(self, adapter):
+        """``tool_choice: "none"`` must reach _run_agent as no_tools=True
+        (agent created with an empty toolset) while the rest of the
+        response stays faithful."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {"final_response": "summary ok", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "tool_choice": "none",
+                        "messages": [{"role": "user", "content": "summarize"}],
+                    },
+                )
+                assert resp.status == 200
+                data = await resp.json()
+
+        assert data["choices"][0]["message"]["content"] == "summary ok"
+        assert mock_run.call_args.kwargs["no_tools"] is True
+
+
+    @pytest.mark.asyncio
+    async def test_chat_completions_tool_choice_none_case_insensitive(self, adapter):
+        """Standard OpenAI sends ``"none"`` but the check must be
+        case-insensitive (``"NONE"`` / ``"None"`` are equivalent)."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {"final_response": "ok", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "tool_choice": "NONE",
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                )
+                assert resp.status == 200
+
+        assert mock_run.call_args.kwargs["no_tools"] is True
+
+
+    @pytest.mark.asyncio
+    async def test_chat_completions_without_tool_choice_keeps_default_tools(self, adapter):
+        """No ``tool_choice`` field, ``"auto"``, or a function-selector dict
+        must NOT disable tools — the agent keeps its normal toolset exactly
+        as before (no ``no_tools`` kwarg reaches _run_agent)."""
+        app = _create_app(adapter)
+
+        async def _post(body):
+            async with TestClient(TestServer(app)) as cli:
+                with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                    mock_run.return_value = (
+                        {"final_response": "ok", "messages": [], "api_calls": 1},
+                        {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                    )
+                    resp = await cli.post("/v1/chat/completions", json=body)
+                    assert resp.status == 200
+                    return mock_run.call_args.kwargs
+
+        for body in [
+            {"model": "hermes-agent", "messages": [{"role": "user", "content": "hi"}]},
+            {"model": "hermes-agent", "tool_choice": "auto", "messages": [{"role": "user", "content": "hi"}]},
+            {"model": "hermes-agent", "tool_choice": "required", "messages": [{"role": "user", "content": "hi"}]},
+            {
+                "model": "hermes-agent",
+                "tool_choice": {"type": "function", "function": {"name": "web_search"}},
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        ]:
+            kwargs = await _post(body)
+            assert "no_tools" not in kwargs, f"tools disabled for body: {body}"
+
+
+    @pytest.mark.asyncio
+    async def test_chat_completions_stream_tool_choice_none_passes_no_tools(self, adapter):
+        """The streaming branch must honor tool_choice "none" too (both
+        branches spread the same agent_overrides)."""
+        app = _create_app(adapter)
+
+        async def _mock_run_agent(**kwargs):
+            cb = kwargs.get("stream_delta_callback")
+            if cb:
+                cb("ok")
+            return (
+                {"final_response": "ok", "messages": [], "api_calls": 1},
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent) as mock_run:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "tool_choice": "none",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+        assert "data: " in body
+        assert mock_run.call_args.kwargs["no_tools"] is True
 
 
     @pytest.mark.asyncio

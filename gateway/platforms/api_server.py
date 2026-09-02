@@ -2598,6 +2598,7 @@ class APIServerAdapter(BasePlatformAdapter):
         route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None,
         confirmed_runtime_lock: bool = False,
+        no_tools: bool = False,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -2606,6 +2607,13 @@ class APIServerAdapter(BasePlatformAdapter):
         base_url, etc. from config.yaml / env vars.  Toolsets are resolved
         from config.yaml platform_toolsets.api_server (same as all other
         gateway platforms), falling back to the hermes-api-server default.
+
+        ``no_tools`` (default False) creates the agent with an EMPTY toolset
+        — ``agent.tools`` is ``[]``, so no tool schemas are sent to the
+        model and no tool can be executed for that run.  Used by the
+        OpenAI-compatible ``tool_choice: "none"`` contract on
+        ``/v1/chat/completions``.  Only affects this agent instance; the
+        global platform toolset configuration is untouched.
 
         ``gateway_session_key`` is a stable per-channel identifier supplied
         by the client (via ``X-Hermes-Session-Key``).  Unlike ``session_id``
@@ -2863,6 +2871,14 @@ class APIServerAdapter(BasePlatformAdapter):
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        if no_tools:
+            # ``tool_choice: "none"`` contract: this run must not expose or
+            # execute ANY tool.  An empty toolset list makes
+            # get_tool_definitions() return ``[]`` → ``agent.tools == []`` →
+            # no tool schemas reach the model payload and tool execution is
+            # structurally impossible.  Both the OpenAI-completions and
+            # Anthropic transports handle an empty tool list gracefully.
+            enabled_toolsets = []
 
         max_iterations = _current_max_iterations()
 
@@ -4156,6 +4172,17 @@ class APIServerAdapter(BasePlatformAdapter):
             virtual_model=self._model_name,
             allow_bare_model=self._direct_model_requests,
         )
+        # OpenAI-compatible ``tool_choice: "none"`` → this request's agent is
+        # created WITHOUT tools (no tool schemas, no tool execution) via the
+        # ``no_tools`` flag.  Any other value — "auto", "required", a function
+        # selector dict, or an absent field — leaves the agent's normal
+        # toolset intact.  Scoped strictly to this handler; the flag only
+        # travels through ``agent_overrides`` into this run's ``_run_agent``
+        # call, so other entry points (session chat, /v1/responses, /v1/runs,
+        # Telegram, ...) are unaffected.
+        _tool_choice = body.get("tool_choice")
+        if isinstance(_tool_choice, str) and _tool_choice.strip().lower() == "none":
+            agent_overrides["no_tools"] = True
         selection_error = self._request_route_conflict_error(
             session_id=session_id,
             gateway_session_key=gateway_session_key,
@@ -6119,6 +6146,7 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        no_tools: bool = False,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -6139,6 +6167,11 @@ class APIServerAdapter(BasePlatformAdapter):
         active the completed agent's actual provider/model must match the
         locked selection or the turn fails, and the response carries
         sanitized ``runtime`` metadata reporting actual vs requested.
+
+        *no_tools* (default False) is forwarded to ``_create_agent`` to
+        build this run's agent with an empty toolset (the OpenAI-compatible
+        ``tool_choice: "none"`` contract).  Defaults to False so every
+        existing caller keeps its current toolset behavior.
 
         If *agent_ref* is a one-element list, the AIAgent instance is stored
         at ``agent_ref[0]`` before ``run_conversation`` begins.  This allows
@@ -6176,6 +6209,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         route=route,
                         session_model=session_model,
                         confirmed_runtime_lock=confirmed_runtime_lock,
+                        no_tools=no_tools,
                     )
                     if agent_ref is not None:
                         agent_ref[0] = agent
