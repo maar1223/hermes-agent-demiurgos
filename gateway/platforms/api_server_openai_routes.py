@@ -489,6 +489,17 @@ class OpenAICompatRoutesMixin:
         route, agent_overrides, selection_error = self._select_request_route(
             body, session_id=session_id, gateway_session_key=gateway_session_key,
             model_alias=model_name)
+        # OpenAI-compatible ``tool_choice: "none"`` → this request's agent is
+        # created WITHOUT tools (no tool schemas, no tool execution) via the
+        # ``no_tools`` flag.  Any other value — "auto", "required", a function
+        # selector dict, or an absent field — leaves the agent's normal
+        # toolset intact.  Scoped strictly to this handler; the flag only
+        # travels through ``agent_overrides`` into this run's ``_run_agent``
+        # call, so other entry points (session chat, /v1/responses, /v1/runs,
+        # Telegram, ...) are unaffected.
+        _tool_choice = body.get("tool_choice")
+        if isinstance(_tool_choice, str) and _tool_choice.strip().lower() == "none":
+            agent_overrides["no_tools"] = True
         if selection_error is not None:
             return selection_error
         run_kwargs = dict(

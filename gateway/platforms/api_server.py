@@ -2092,11 +2092,17 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         model_options: Optional[Dict[str, Any]] = None, route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None, confirmed_runtime_lock: bool = False,
         room_dispatch: Optional[Dict[str, Any]] = None,
-        room_execution_policy: Optional[Dict[str, Any]] = None) -> Any:
+        room_execution_policy: Optional[Dict[str, Any]] = None,
+        no_tools: bool = False) -> Any:
         """Create an AIAgent from the gateway runtime config + platform toolsets.
         ``gateway_session_key`` persists across transcripts (memory scope), unlike ``session_id``;
         ``route`` / ``session_model`` are mutually exclusive; ``confirmed_runtime_lock`` beats the
-        session ``/model`` override, disables the fallback chain and fails closed."""
+        session ``/model`` override, disables the fallback chain and fails closed.
+        ``no_tools`` (default False) creates the agent with an EMPTY toolset — ``agent.tools``
+        is ``[]``, so no tool schemas are sent to the model and no tool can be executed for
+        that run.  Used by the OpenAI-compatible ``tool_choice: "none"`` contract on
+        ``/v1/chat/completions``.  Only affects this agent instance; the global platform
+        toolset configuration is untouched."""
         from run_agent import AIAgent
         from gateway.run import (
             _checkpoint_agent_kwargs, _current_max_iterations, _resolve_runtime_agent_kwargs,
@@ -2120,6 +2126,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             gateway_session_key=gateway_session_key, session_id=session_id)
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        if no_tools:
+            # ``tool_choice: "none"`` contract: this run must not expose or
+            # execute ANY tool.  An empty toolset list makes
+            # get_tool_definitions() return ``[]`` → ``agent.tools == []`` →
+            # no tool schemas reach the model payload and tool execution is
+            # structurally impossible.  Both the OpenAI-completions and
+            # Anthropic transports handle an empty tool list gracefully.
+            enabled_toolsets = []
         max_iterations = _current_max_iterations()
         if room_dispatch is not None:
             from gateway.hosted_room_execution_policy import RoomExecutionPolicy
@@ -3621,11 +3635,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         requested_provider: Optional[str] = None, model_options: Optional[Dict[str, Any]] = None,
         route: Optional[Dict[str, Any]] = None, session_model: Optional[str] = None,
         requested_runtime: Optional[Dict[str, Any]] = None, route_source: str = "global",
-        confirmed_runtime_lock: bool = False, bind_declared_conversation: bool = False) -> tuple:
+        confirmed_runtime_lock: bool = False, bind_declared_conversation: bool = False,
+        no_tools: bool = False) -> tuple:
         """Create an agent and run one turn in a thread executor -> ``(result, usage)``.
         ``agent_ref[0]`` receives the agent so SSE writers can interrupt it; ``active_run_id``
         registers it in ``_active_run_agents``. Under a confirmed model lock the actual
-        provider/model must match or the turn fails; ``runtime`` metadata is attached."""
+        provider/model must match or the turn fails; ``runtime`` metadata is attached.
+        ``no_tools`` (default False) is forwarded to ``_create_agent`` to build this run's
+        agent with an empty toolset (the OpenAI-compatible ``tool_choice: "none"`` contract).
+        Defaults to False so every existing caller keeps its current toolset behavior."""
         loop = asyncio.get_running_loop()
         # ContextVars do not follow run_in_executor threads: capture here, re-enter in _run().
         request_profile = _api_request_profile.get()
@@ -3648,7 +3666,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         tool_start_callback=tool_start_callback, tool_complete_callback=tool_complete_callback,
                         gateway_session_key=gateway_session_key, requested_model=requested_model,
                         requested_provider=requested_provider, model_options=model_options, route=route,
-                        session_model=session_model, confirmed_runtime_lock=confirmed_runtime_lock)
+                        session_model=session_model, confirmed_runtime_lock=confirmed_runtime_lock,
+                        no_tools=no_tools)
                     if agent_ref is not None:
                         agent_ref[0] = agent
                     if active_run_id:
