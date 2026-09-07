@@ -1446,6 +1446,12 @@ class _CodexCompletionsAdapter:
         if timeout is not None:
             resp_kwargs["timeout"] = timeout
 
+        # Forward caller-supplied extra headers (e.g. the OpenCode
+        # ``x-opencode-session`` session-affinity header injected by
+        # _build_call_kwargs) onto the Responses request.
+        if isinstance(kwargs.get("extra_headers"), dict) and kwargs["extra_headers"]:
+            resp_kwargs["extra_headers"] = dict(kwargs["extra_headers"])
+
         # Note: the Codex endpoint (chatgpt.com/backend-api/codex) does NOT
         # support max_output_tokens or temperature — omit to avoid 400 errors.
 
@@ -1965,6 +1971,15 @@ class _AnthropicCompletionsAdapter:
             from agent.anthropic_adapter import _forbids_sampling_params
             if not _forbids_sampling_params(model):
                 anthropic_kwargs["temperature"] = temperature
+
+        # Forward caller-supplied extra headers (e.g. the OpenCode
+        # ``x-opencode-session`` session-affinity header injected by
+        # _build_call_kwargs) onto the Anthropic Messages request.
+        if isinstance(kwargs.get("extra_headers"), dict) and kwargs["extra_headers"]:
+            anthropic_kwargs["extra_headers"] = {
+                **(anthropic_kwargs.get("extra_headers") or {}),
+                **kwargs["extra_headers"],
+            }
 
         # Pass through caller-supplied extra_body so providers behind
         # Anthropic-compatible gateways receive their per-vendor request
@@ -8359,7 +8374,16 @@ def _build_call_kwargs(
         ):
             kwargs["_reasoning_config"] = dict(reasoning_config)
 
-    return kwargs
+    # OpenCode relay requires a stable ``x-opencode-session`` header on every
+    # request for backend affinity. The auxiliary client has no session handle
+    # of its own, so it threads the runtime session_id (published by
+    # set_runtime_main from the owning main turn). merge_... only injects the
+    # header for OpenCode targets; non-OpenCode targets are unchanged.
+    from agent.opencode_affinity import merge_opencode_session_headers
+
+    return merge_opencode_session_headers(
+        kwargs, provider, base_url, _runtime_main_value("session_id") or None
+    )
 
 
 def _validate_llm_response(
